@@ -677,6 +677,28 @@ contract RoundBasedDecayTest is Test {
         assertEq(minter.totalMinted(), 0, "minter not invoked");
     }
 
+    /// maxMintPerClaim cap: blocks runaway claims (e.g. distributor bug).
+    function test_maxMintPerClaim_blocksOverlimitClaim() public {
+        uint256 tid = _mint(holderA, 0, "fire");
+        for (uint256 i = 0; i < 5; ++i) _notify(100 ether);
+        // NFT alone in pool, total accrued = 500 ether.
+
+        // Set cap below accrued.
+        vm.prank(owner); dist.setMaxMintPerClaim(300 ether);
+
+        uint256[] memory ids = new uint256[](1); ids[0] = tid;
+        vm.prank(holderA);
+        vm.expectRevert(EmissionDistributorV2.MintAboveCap.selector);
+        dist.claim(ids);
+
+        // Raise cap above accrued and retry — succeeds.
+        vm.prank(owner); dist.setMaxMintPerClaim(1000 ether);
+        uint256 balBefore = ardi.balanceOf(holderA);
+        vm.prank(holderA); dist.claim(ids);
+        assertEq(ardi.balanceOf(holderA) - balBefore, 500 ether,
+            "claim succeeds when total <= cap");
+    }
+
     /// Operator spam attack mitigation check: notifyReward(0) still
     /// advances rounds. Documents the (accepted) attack surface — operator
     /// key compromise can drain everyone's dura but cannot mint tokens.

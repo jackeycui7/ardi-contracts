@@ -71,6 +71,15 @@ contract EmissionDistributorV2 is EmissionDistributor {
     ///         post-deactivate transfer carries it to the new owner.
     mapping(uint256 => uint256) public unclaimedByToken;
 
+    /// @notice (Audit safety) Per-claim mint cap. If non-zero, a single
+    ///         `claim` call cannot mint more than this many $ardi. Defends
+    ///         against a distributor-side accumulator bug or a compromised
+    ///         upgrade that would otherwise let one user drain the
+    ///         WorknetToken's full annual mint budget in one tx. Set by
+    ///         owner; recommended ~3× a power-81 NFT's lifetime earning
+    ///         (e.g. 75M $ardi for an early-launch param sweep). 0 = off.
+    uint256 public maxMintPerClaim;
+
     // ============================ V32 events ============================
 
     event RewardNotifiedV2(
@@ -82,10 +91,12 @@ contract EmissionDistributorV2 is EmissionDistributor {
     );
     event ArdiNFTv32Set(address ardiNFTv32);
     event RewardMinterSet(address rewardMinter);
+    event MaxMintPerClaimSet(uint256 cap);
 
     error AdapterNotSet();
     error AdapterMismatch();
     error MinterNotSet();
+    error MintAboveCap();
 
     // ============================ Setup =================================
 
@@ -104,6 +115,16 @@ contract EmissionDistributorV2 is EmissionDistributor {
         if (m == address(0)) revert ZeroAddress();
         rewardMinter = IRewardMinter(m);
         emit RewardMinterSet(m);
+    }
+
+    /// @notice Owner: set per-claim mint cap. 0 disables the cap. A
+    ///         distributor-side bug or a malicious upgrade could otherwise
+    ///         let a single claim drain the WorknetToken's annual mint
+    ///         budget. Recommended ~3× a max-power lifetime (e.g. 75M
+    ///         $ardi during early-launch parameter sweep).
+    function setMaxMintPerClaim(uint256 v) external onlyOwner {
+        maxMintPerClaim = v;
+        emit MaxMintPerClaimSet(v);
     }
 
     // ============================ Reward =================================
@@ -276,6 +297,12 @@ contract EmissionDistributorV2 is EmissionDistributor {
         }
 
         if (total > 0) {
+            // Defense-in-depth: cap the per-claim mint so a distributor-side
+            // accumulator bug or malicious upgrade can't drain the entire
+            // WorknetToken annual budget in one shot. Disabled (0) = off.
+            uint256 cap = maxMintPerClaim;
+            if (cap != 0 && total > cap) revert MintAboveCap();
+
             address[] memory recipients = new address[](1);
             uint256[] memory amounts = new uint256[](1);
             recipients[0] = msg.sender;
@@ -358,5 +385,5 @@ contract EmissionDistributorV2 is EmissionDistributor {
 
     // ============================ Storage gap ============================
 
-    uint256[46] private __v32Gap;
+    uint256[45] private __v32Gap;
 }
