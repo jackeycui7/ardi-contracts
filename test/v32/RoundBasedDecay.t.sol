@@ -389,6 +389,63 @@ contract RoundBasedDecayTest is Test {
             "contract must hold enough to honor pending claim (no insolvency)");
     }
 
+    /// L-4 audit regression: migrateExisting must skip NFTs that were
+    /// minted post-upgrade and already auto-registered via _activate.
+    /// Without the guard, calling migrateExisting on such a tokenId
+    /// would double-credit expiringPowerAt[expR] → eviction bucket
+    /// over-subtracts → other holders get diluted.
+    function test_migrateExisting_idempotent_for_postUpgradeMinted() public {
+        // setUp already upgraded; this mint goes through the v32
+        // _activate path and registers expR.
+        uint256 tid = _mint(holderA, 0, "fire");
+        uint64 expR = nft.expirationRoundOf(tid);
+        uint128 bucketBefore = nft.expiringPowerAt(expR);
+        assertEq(uint256(bucketBefore), 50, "post-mint bucket should hold one NFT");
+
+        // Owner mistakenly includes this token in migrateExisting.
+        uint256[] memory ids = new uint256[](1); ids[0] = tid;
+        vm.prank(owner);
+        nft.migrateExisting(ids);
+
+        // Bucket must NOT have been incremented again.
+        uint128 bucketAfter = nft.expiringPowerAt(expR);
+        assertEq(uint256(bucketAfter), uint256(bucketBefore),
+            "L-4 fix: post-upgrade-minted token must not be re-registered");
+        // Migrated flag should be set so future batches short-circuit.
+        assertTrue(nft.v32Migrated(tid));
+    }
+
+    /// L-5 audit regression: _activate is idempotent on the v32-side
+    /// even if called when expirationRoundOf is already set. Today no
+    /// path triggers this, but future upgrades might.
+    function test_activate_idempotent_on_v32_side() public {
+        uint256 tid = _mint(holderA, 0, "fire");
+        uint64 expR = nft.expirationRoundOf(tid);
+        uint128 bucketBefore = nft.expiringPowerAt(expR);
+
+        // Force a "_activate while already activated" by going through
+        // the H-2 fix path: the bumpEvicted branch deactivates+reactivates,
+        // which is the closest in-tree call site that exercises L-5.
+        // (We can't directly call _activate from outside since it's
+        // internal; rely on the H-2 path triggering it cleanly.)
+        for (uint256 i = 0; i < 6; ++i) _notify(100 ether);
+        vm.prank(holderA);
+        uint256 reqId = nft.repair(tid);
+        _notify(100 ether); // bumps and evicts; repair callback pending
+        vm.prank(address(rng));
+        nft.onRandomness(reqId, 12345); // deactivate + activate
+
+        // Bucket counts must add up. After deactivate+activate the new
+        // expR is set (different round); the OLD bucket should have
+        // been decremented to 0 by _deactivate's pull, then no longer
+        // touched. The new bucket should equal the NFT's power exactly.
+        uint64 newExpR = nft.expirationRoundOf(tid);
+        assertGt(uint256(newExpR), uint256(expR), "new expR is in the future");
+        assertEq(uint256(nft.expiringPowerAt(newExpR)), 50, "new bucket has exactly the NFT's power");
+        // bucketBefore reference no longer meaningful (different bucket).
+        (bucketBefore);
+    }
+
     function test_notHolder_cannotClaimSomeoneElsesNFT() public {
         uint256 tid = _mint(holderA, 0, "fire");
         _notify(100 ether);

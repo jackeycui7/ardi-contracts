@@ -143,8 +143,18 @@ contract ArdiNFTv32 is ArdiNFTv3 {
     /// @notice Override registers the NFT's expiration round in
     ///         `expiringPowerAt[round]` so the round-bump path can pop it
     ///         out of the active pool atomically when its time comes.
+    /// @dev    Idempotent: if `expirationRoundOf[tokenId] != 0` we skip
+    ///         the registry update — the NFT is already counted, and a
+    ///         second `+=` would double-credit `expiringPowerAt`. This
+    ///         is L-5 audit defense: today's call paths all go through
+    ///         a clean (expR == 0) state before _activate, but future
+    ///         upgrade additions might not.
     function _activate(uint256 tokenId, address holder) internal virtual override {
         super._activate(tokenId, holder);
+        if (expirationRoundOf[tokenId] != 0) {
+            // Already registered — silent no-op on the v32 side.
+            return;
+        }
         Inscription storage ins = inscriptions[tokenId];
         // Compute expiration round = currentRound + currentDurability.
         // For freshly-minted NFTs, currentDurability == maxDurability.
@@ -279,6 +289,16 @@ contract ArdiNFTv32 is ArdiNFTv3 {
             Inscription storage ins = inscriptions[tid];
             if (!ins.activeTracked) {
                 v32Migrated[tid] = true; // mark even when skipped — never revisit
+                continue;
+            }
+            // L-4 audit defense: skip if already registered via post-
+            // upgrade _activate (e.g. NFT minted after the upgrade).
+            // Without this guard a second `expiringPowerAt[expR] +=
+            // power` would double-count the NFT in the eviction
+            // bucket. v32Migrated is also set so subsequent batch
+            // calls short-circuit on the cheaper flag check.
+            if (expirationRoundOf[tid] != 0) {
+                v32Migrated[tid] = true;
                 continue;
             }
 

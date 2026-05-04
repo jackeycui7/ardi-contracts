@@ -159,3 +159,22 @@ correctable / UI-only and don't affect on-chain solvency.
   (onDeactivate's `wasBumpEvicted` guard skips the totalActive
   subtraction; onActivate adds the power back). Regression test:
   `test_repairBumpEvictedDuringVRF_noLeak` confirms post-fix solvency.
+
+## Audit fixes applied (third pass, 2026-05-04)
+
+- **L-4**: `migrateExisting` previously only short-circuited on the
+  `v32Migrated` flag and the `!ins.activeTracked` check. If owner
+  passed a tokenId that was minted POST-upgrade (already auto-
+  registered via `_activate`), the function would re-register it,
+  doubling its entry in `expiringPowerAt[expR]`. On expiration that
+  bucket would over-subtract from `totalActivePower`, diluting other
+  holders' rewards. Fix: skip when `expirationRoundOf[tid] != 0`.
+- **L-5**: `_activate` had no v32-side idempotency. Today every call
+  path arrives in a clean (expR == 0) state, but a future upgrade
+  could break that invariant and silently double-credit
+  `expiringPowerAt`. Defense-in-depth: early return if
+  `expirationRoundOf[tokenId] != 0`. No semantic change for current
+  call sites.
+
+Test count 12 → 14 (added `test_migrateExisting_idempotent_for_postUpgradeMinted`
+and `test_activate_idempotent_on_v32_side`).
