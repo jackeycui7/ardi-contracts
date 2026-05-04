@@ -227,9 +227,11 @@ contract ArdiNFTv32 is ArdiNFTv3 {
         _flushSinkRepair(req.paid);
         delete pendingRepairOf[req.tokenId];
         delete pending[reqId];
-        unchecked {
-            --pendingRequestsCount;
-        }
+        // Checked decrement (L-1 audit fix): an underflow here would
+        // mean we've fulfilled more repairs than we requested — should
+        // never happen, but keep the invariant load-bearing rather than
+        // silently rolling over to type(uint256).max.
+        --pendingRequestsCount;
         emit RepairFulfilled(req.tokenId, reqId, false);
     }
 
@@ -275,6 +277,13 @@ contract ArdiNFTv32 is ArdiNFTv3 {
     ///         corrections (e.g. an NFT got into a weird state via a
     ///         partial migration). Reverts on inactive tokens.
     function adminSetDurability(uint256 tokenId, uint8 newValue) external onlyOwner {
+        _setDurability(tokenId, newValue);
+    }
+
+    /// @dev Internal worker so other admin paths can re-use without
+    ///      taking the external onlyOwner detour (which would change
+    ///      msg.sender to address(this) and revert).
+    function _setDurability(uint256 tokenId, uint8 newValue) internal {
         Inscription storage ins = inscriptions[tokenId];
         if (!ins.activeTracked) revert NotActiveTracked();
         if (newValue > ins.maxDurability) revert InvalidDurability();
@@ -288,16 +297,13 @@ contract ArdiNFTv32 is ArdiNFTv3 {
         }
         uint8 prev = ins.currentDurability;
         ins.currentDurability = newValue;
-        if (newValue == 0) {
-            // Schedule for removal at the very next bump.
-            uint64 newExp = globalDecayRound + 1;
-            expirationRoundOf[tokenId] = newExp;
-            expiringPowerAt[newExp] += p;
-        } else {
-            uint64 newExp = globalDecayRound + uint64(newValue);
-            expirationRoundOf[tokenId] = newExp;
-            expiringPowerAt[newExp] += p;
-        }
+        // Schedule for removal at the next bump if newValue==0; otherwise
+        // give the NFT `newValue` more rounds. Both branches register the
+        // power into the appropriate future bucket.
+        uint64 newExp =
+            newValue == 0 ? globalDecayRound + 1 : globalDecayRound + uint64(newValue);
+        expirationRoundOf[tokenId] = newExp;
+        expiringPowerAt[newExp] += p;
         emit AdminDurabilitySet(tokenId, prev, newValue);
     }
 
@@ -342,8 +348,10 @@ contract ArdiNFTv32 is ArdiNFTv3 {
         uint8 prev = ins.maxDurability;
         ins.maxDurability = newMax;
         if (ins.currentDurability > newMax) {
-            // Walk the registry to keep it consistent.
-            this.adminSetDurability(tokenId, newMax);
+            // Direct internal call — avoids the v32-audit H-1 footgun
+            // where `this.adminSetDurability(...)` makes msg.sender be
+            // the contract itself, which fails the onlyOwner check.
+            _setDurability(tokenId, newMax);
         }
         emit AdminMaxDurabilitySet(tokenId, prev, newMax);
     }

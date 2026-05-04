@@ -152,19 +152,32 @@ contract EmissionDistributorV2 is EmissionDistributor {
     ///         of accRewardPerPower from the end of its expirationRound
     ///         once we're past that round, so post-expiration rewards
     ///         don't accrue to it.
+    /// @dev    M-1 audit fix: `expR == 0` previously fell through to
+    ///         `accRewardPerPower`, which let UNMIGRATED pre-v32 NFTs
+    ///         claim the full accumulated reward as if they'd been
+    ///         alive the whole time (their `s.rewardDebt = 0` from v3
+    ///         mint multiplies straight against acc). Now we return the
+    ///         already-settled debt's-equivalent acc — i.e. the NFT's
+    ///         pending sums to 0 — so an operator who notifyReward'd
+    ///         before completing migration cannot accidentally give
+    ///         away the protocol's $ardi. Owner is forced to follow
+    ///         the documented order: pause → migrate → unpause.
     function _capAcc(uint256 tokenId) internal view returns (uint256) {
         uint64 expR = ardiNFTv32.expirationRoundOf(tokenId);
-        if (expR == 0) return accRewardPerPower; // never registered, treat as live
+        if (expR == 0) {
+            // Unmigrated. Return the per-power debt level so accrued
+            // exactly equals s.rewardDebt and pending = 0.
+            // (Equivalent to "this NFT earns nothing until migrated".)
+            TokenSlot storage s = tokens[tokenId];
+            if (s.power == 0) return 0;
+            return (uint256(s.rewardDebt) * ACC_PRECISION) / uint256(s.power);
+        }
         uint64 cur = ardiNFTv32.globalDecayRound();
         if (cur <= expR) return accRewardPerPower;
-        // Expired — use snapshot.
+        // Expired — use snapshot. Should always be set because
+        // notifyReward stamps it every round; guard anyway.
         uint256 snap = accAtEndOfRound[expR];
-        // If snapshot is missing (theoretical: shouldn't happen because
-        // notifyReward stamps every round), fall back to current. The
-        // NFT will get one extra round of leakage in that pathological
-        // case, never less than they earned.
-        if (snap == 0 && expR != 0) return accRewardPerPower;
-        return snap;
+        return snap == 0 ? accRewardPerPower : snap;
     }
 
     function pendingFor(address holder, uint256[] calldata tokenIds)

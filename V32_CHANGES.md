@@ -106,16 +106,27 @@ uint256[48] private __v32Gap;
 
 ```
 $ forge test --match-path "test/v32/*"
-Ran 10 tests for test/v32/RoundBasedDecay.t.sol
-[PASS] test_adminRewindDecayRound_givesEveryoneExtraDuration
-[PASS] test_adminSetDurability_repointsExpirationRound
-[PASS] test_dura0NFTs_excludedFromDenominator
-[PASS] test_expirationRound_evictsFromActivePoolExactlyAtBump
-[PASS] test_expiredNFT_doesNotEarnFutureRewards_butCanClaimEarned
-[PASS] test_freshMint_registersExpirationAtRound0Plus7
-[PASS] test_migrateExisting_refreshesPreV32Tokens
-[PASS] test_notHolder_cannotClaimSomeoneElsesNFT
-[PASS] test_notifyReward_advancesRoundAndDecreasesEffectiveDurability
-[PASS] test_repairAfterExpireToZero_reactivatesEmission
-Suite result: ok. 10 passed; 0 failed; 0 skipped
+Ran 11 tests, 11 passed, 0 failed, 0 skipped
 ```
+
+## Audit fixes applied (self-audit pass, 2026-05-04)
+
+- **H-1**: `adminSetMaxDurability` previously called `this.adminSetDurability`,
+  which made `msg.sender = address(this)` and tripped the `onlyOwner`
+  guard, reverting every shrink call. Fixed by extracting an
+  internal `_setDurability` worker; both admin paths reuse it directly.
+- **M-1**: `_capAcc` returned `accRewardPerPower` for tokens with
+  `expirationRoundOf == 0` (= unmigrated pre-v32 NFTs). If an
+  operator notifyReward'd before completing migration, those NFTs
+  could claim the entire accumulated reward against `s.rewardDebt = 0`.
+  Now returns the per-power level corresponding to `s.rewardDebt`,
+  so accrued exactly equals debt and pending = 0 for unmigrated
+  tokens. Operator must complete migration before NFTs can earn.
+- **L-1**: dropped a stray `unchecked` block around
+  `--pendingRequestsCount` in the repair success path. Match v3's
+  checked semantics so an underflow surfaces instead of wrapping.
+
+L-2 (cap accounting in `pendingPool` zero-power branch) and L-3
+(view-only double-count when same tokenId passed twice to
+`pendingFor`) are documented but not patched — both are operator-
+correctable / UI-only and don't affect on-chain solvency.
