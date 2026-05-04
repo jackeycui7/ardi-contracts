@@ -4,12 +4,21 @@ pragma solidity ^0.8.24;
 import {EmissionDistributor} from "../v3/EmissionDistributor.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 
 /// @dev Minimal interface for the v32 ArdiNFT extension.
 interface IArdiNFTv32 {
     function bumpDecayRound() external returns (uint128 expiredPower, uint64 newRound);
     function expirationRoundOf(uint256 tokenId) external view returns (uint64);
     function globalDecayRound() external view returns (uint64);
+}
+
+/// @dev External batch-mint contract (existing protocol component, gated by
+///      MERKLE_ROLE). EmissionDistributorV2 is granted the role and calls it
+///      from claim(). Distributor never holds $ardi — token is freshly minted
+///      to the claimer at the moment of claim.
+interface IRewardMinter {
+    function batchMint(address[] calldata recipients, uint256[] calldata amounts) external;
 }
 
 /// @title  EmissionDistributorV2 — round-aware reward distribution
@@ -50,6 +59,18 @@ contract EmissionDistributorV2 is EmissionDistributor {
     ///         without a fragile low-level call.
     IArdiNFTv32 public ardiNFTv32;
 
+    /// @notice External batch-mint contract. Distributor calls
+    ///         `rewardMinter.batchMint([user], [amount])` at claim time
+    ///         instead of holding pre-funded $ardi. Owner-set; must hold
+    ///         MERKLE_ROLE on the underlying minter so its calls succeed.
+    IRewardMinter public rewardMinter;
+
+    /// @notice Per-token unclaimed reward that has been "settled" off the
+    ///         active accumulator (e.g. on dura→0 deactivation) but not yet
+    ///         minted to any address. Stays attached to the tokenId, so a
+    ///         post-deactivate transfer carries it to the new owner.
+    mapping(uint256 => uint256) public unclaimedByToken;
+
     // ============================ V32 events ============================
 
     event RewardNotifiedV2(
@@ -60,9 +81,11 @@ contract EmissionDistributorV2 is EmissionDistributor {
         uint64 newRound
     );
     event ArdiNFTv32Set(address ardiNFTv32);
+    event RewardMinterSet(address rewardMinter);
 
     error AdapterNotSet();
     error AdapterMismatch();
+    error MinterNotSet();
 
     // ============================ Setup =================================
 
@@ -72,6 +95,15 @@ contract EmissionDistributorV2 is EmissionDistributor {
         if (a != ardiNFT) revert AdapterMismatch();
         ardiNFTv32 = IArdiNFTv32(a);
         emit ArdiNFTv32Set(a);
+    }
+
+    /// @notice Owner: bind the external reward-minter contract. Must hold
+    ///         MERKLE_ROLE on the underlying $ardi minter. Distributor itself
+    ///         never holds tokens — it just calls batchMint at claim time.
+    function setRewardMinter(address m) external onlyOwner {
+        if (m == address(0)) revert ZeroAddress();
+        rewardMinter = IRewardMinter(m);
+        emit RewardMinterSet(m);
     }
 
     // ============================ Reward =================================
@@ -88,9 +120,9 @@ contract EmissionDistributorV2 is EmissionDistributor {
 
         if (maxNotifyAmount != 0 && amount > maxNotifyAmount) revert AmountAboveCap();
 
-        if (amount > 0) {
-            ardi.safeTransferFrom(msg.sender, address(this), amount);
-        }
+        // Mint-on-claim: distributor does NOT receive tokens here. notifyReward
+        // is now a pure account update — accRewardPerPower and decay-round
+        // state only. Actual $ardi is minted by `rewardMinter` at claim time.
 
         uint128 totalPowerBefore = uint128(totalActivePower);
         // 1. Distribute `amount` (plus any queued pendingPool) at current
@@ -180,64 +212,75 @@ contract EmissionDistributorV2 is EmissionDistributor {
         return snap == 0 ? accRewardPerPower : snap;
     }
 
-    function pendingFor(address holder, uint256[] calldata tokenIds)
+    /// @notice Sum of claimable reward across `tokenIds`. View-only — no
+    ///         ownerOf check (a view shouldn't revert on garbage input from
+    ///         frontends, and the caller can already query whatever they
+    ///         like). Auth lives in `claim`. Includes active accrual plus
+    ///         any reward parked on the token via prior deactivation.
+    function pendingFor(address /* holder */, uint256[] calldata tokenIds)
         external
         view
         virtual
         override
         returns (uint256 total)
     {
-        total = pendingOf[holder];
-        if (address(ardiNFTv32) == address(0)) {
-            // Fallback to v3 behavior if not yet wired post-upgrade.
-            for (uint256 i = 0; i < tokenIds.length; ++i) {
-                TokenSlot storage s = tokens[tokenIds[i]];
-                if (s.power == 0) continue;
-                uint256 accrued = (uint256(s.power) * accRewardPerPower) / ACC_PRECISION;
+        for (uint256 i = 0; i < tokenIds.length; ++i) {
+            uint256 tid = tokenIds[i];
+            TokenSlot storage s = tokens[tid];
+            if (s.power != 0) {
+                uint256 cap = address(ardiNFTv32) == address(0)
+                    ? accRewardPerPower
+                    : _capAcc(tid);
+                uint256 accrued = (uint256(s.power) * cap) / ACC_PRECISION;
                 if (accrued > s.rewardDebt) total += accrued - s.rewardDebt;
             }
-            return total;
-        }
-        for (uint256 i = 0; i < tokenIds.length; ++i) {
-            TokenSlot storage s = tokens[tokenIds[i]];
-            if (s.power == 0) continue;
-            uint256 accrued = (uint256(s.power) * _capAcc(tokenIds[i])) / ACC_PRECISION;
-            if (accrued > s.rewardDebt) total += accrued - s.rewardDebt;
+            total += unclaimedByToken[tid];
         }
     }
 
+    /// @notice Mint-on-claim. For each tokenId held by msg.sender (verified
+    ///         against IERC721.ownerOf — ground truth, no stale-cache risk),
+    ///         settle active accrual into rewardDebt and drain any reward
+    ///         that had been parked on the tokenId by a prior deactivation.
+    ///         Total is freshly minted to msg.sender via the external
+    ///         rewardMinter. Distributor itself never holds $ardi.
     function claim(uint256[] calldata tokenIds) external virtual override whenNotPaused nonReentrant {
-        uint256 total = pendingOf[msg.sender];
-        pendingOf[msg.sender] = 0;
+        if (address(rewardMinter) == address(0)) revert MinterNotSet();
 
-        if (address(ardiNFTv32) == address(0)) {
-            // Pre-wire fallback — same as v3.
-            for (uint256 i = 0; i < tokenIds.length; ++i) {
-                TokenSlot storage s = tokens[tokenIds[i]];
-                if (s.power == 0) continue;
-                if (s.holder != msg.sender) revert NotHolder();
-                uint256 accrued = (uint256(s.power) * accRewardPerPower) / ACC_PRECISION;
-                if (accrued > s.rewardDebt) {
-                    total += accrued - s.rewardDebt;
-                    s.rewardDebt = uint128(accrued);
-                }
-            }
-        } else {
-            for (uint256 i = 0; i < tokenIds.length; ++i) {
-                TokenSlot storage s = tokens[tokenIds[i]];
-                if (s.power == 0) continue;
-                if (s.holder != msg.sender) revert NotHolder();
-                uint256 cap = _capAcc(tokenIds[i]);
+        uint256 total = 0;
+        IERC721 nft = IERC721(ardiNFT);
+
+        for (uint256 i = 0; i < tokenIds.length; ++i) {
+            uint256 tid = tokenIds[i];
+            // Reward follows NFT: only the *current* owner can claim, even
+            // for reward that accrued under a prior owner.
+            if (nft.ownerOf(tid) != msg.sender) revert NotHolder();
+
+            TokenSlot storage s = tokens[tid];
+            if (s.power != 0) {
+                uint256 cap = address(ardiNFTv32) == address(0)
+                    ? accRewardPerPower
+                    : _capAcc(tid);
                 uint256 accrued = (uint256(s.power) * cap) / ACC_PRECISION;
                 if (accrued > s.rewardDebt) {
                     total += accrued - s.rewardDebt;
                     s.rewardDebt = uint128(accrued);
                 }
             }
+
+            uint256 parked = unclaimedByToken[tid];
+            if (parked != 0) {
+                total += parked;
+                unclaimedByToken[tid] = 0;
+            }
         }
 
         if (total > 0) {
-            ardi.safeTransfer(msg.sender, total);
+            address[] memory recipients = new address[](1);
+            uint256[] memory amounts = new uint256[](1);
+            recipients[0] = msg.sender;
+            amounts[0] = total;
+            rewardMinter.batchMint(recipients, amounts);
         }
         emit Claimed(msg.sender, total);
     }
@@ -264,7 +307,10 @@ contract EmissionDistributorV2 is EmissionDistributor {
         uint256 accrued = (power * cap) / ACC_PRECISION;
         uint256 owed = accrued > s.rewardDebt ? accrued - s.rewardDebt : 0;
         if (owed > 0) {
-            pendingOf[holder] += owed;
+            // Reward-follows-NFT: stash on the tokenId, NOT on `holder`. If
+            // the NFT is later transferred or repaired-then-transferred, the
+            // new owner is the one who gets to claim this.
+            unclaimedByToken[tokenId] += owed;
         }
 
         bool wasBumpEvicted = false;
@@ -285,27 +331,32 @@ contract EmissionDistributorV2 is EmissionDistributor {
         emit Deactivated(tokenId, holder, owed);
     }
 
-    /// @notice Round-aware transfer hook. Settles `from`'s pending using
-    ///         the cap-aware accumulator (so an expired NFT being
-    ///         transferred doesn't credit `from` with post-expiration
-    ///         rewards), then rotates holder. Same shape as the v3 hook.
+    /// @notice Reward-follows-NFT transfer hook. Does NOT settle pending to
+    ///         `from`; does NOT touch rewardDebt. The accumulated unclaimed
+    ///         reward stays attached to the tokenId and is claimable by `to`
+    ///         after the transfer.
+    ///
+    ///         Buyer-beware semantics: an unclaimed-reward-bearing NFT trades
+    ///         at a market price that already reflects its unclaimed pending,
+    ///         so settle-on-transfer would just be an extra side-effect with
+    ///         no economic benefit. Reward = part of the NFT.
+    ///
+    ///         If the NFT is already deactivated (s.power==0, e.g. dura→0),
+    ///         we still permit the transfer (the underlying ERC721 transfer
+    ///         shouldn't be blocked by distributor state). The post-deactivate
+    ///         reward lives in `unclaimedByToken[tokenId]` and is claimable by
+    ///         the new owner.
     function onTransfer(uint256 tokenId, address from, address to) external virtual override onlyArdiNFT {
         TokenSlot storage s = tokens[tokenId];
-        if (s.power == 0) revert NotActive();
-        uint256 cap = address(ardiNFTv32) == address(0)
-            ? accRewardPerPower
-            : _capAcc(tokenId);
-        uint256 accrued = (uint256(s.power) * cap) / ACC_PRECISION;
-        uint256 owed = accrued > s.rewardDebt ? accrued - s.rewardDebt : 0;
-        if (owed > 0) {
-            pendingOf[from] += owed;
+        if (s.power != 0) {
+            // Active: just rotate the cached holder. No settle.
+            s.holder = to;
         }
-        s.rewardDebt = uint128(accrued);
-        s.holder = to;
+        // Inactive: nothing to rotate; unclaimedByToken[tokenId] stays put.
         emit Transferred(tokenId, from, to);
     }
 
     // ============================ Storage gap ============================
 
-    uint256[48] private __v32Gap;
+    uint256[46] private __v32Gap;
 }

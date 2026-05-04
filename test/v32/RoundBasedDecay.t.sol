@@ -44,6 +44,20 @@ contract MockVRF is IRandomnessSource {
         uint256 id = next; next = id + 1; return id;
     }
 }
+/// @dev Stand-in for the production AWP batch-mint contract. Mints fresh
+///      MockArdi tokens on demand, recording cumulative mint for assertions.
+contract MockMinter {
+    MockArdi public ardi;
+    uint256 public totalMinted;
+    constructor(MockArdi a) { ardi = a; }
+    function batchMint(address[] calldata recipients, uint256[] calldata amounts) external {
+        require(recipients.length == amounts.length, "len");
+        for (uint256 i = 0; i < recipients.length; ++i) {
+            ardi.mint(recipients[i], amounts[i]);
+            totalMinted += amounts[i];
+        }
+    }
+}
 
 /// @notice End-to-end tests for the v3 → v32 upgrade. Validates:
 ///   • round-based decay replaces time-based
@@ -57,6 +71,7 @@ contract RoundBasedDecayTest is Test {
     MockArdi ardi;
     MockEpochDraw draw;
     MockVRF rng;
+    MockMinter minter;
 
     address owner = address(0xa11ce);
     address coord = address(0xc0c0);
@@ -100,6 +115,8 @@ contract RoundBasedDecayTest is Test {
         nft = ArdiNFTv32(nftProxy);
         dist = EmissionDistributorV2(edProxy);
         dist.setArdiNFTv32(nftProxy);
+        minter = new MockMinter(ardi);
+        dist.setRewardMinter(address(minter));
         vm.stopPrank();
 
         // Step 4: seed balances + approvals.
@@ -383,10 +400,21 @@ contract RoundBasedDecayTest is Test {
 
         uint256[] memory ids = new uint256[](1); ids[0] = tid;
         uint256 pendingPostFix = dist.pendingFor(holderA, ids);
-        // Total deposited to the distributor: 10 notifies × 100 ether = 1000
-        uint256 contractBalance = ardi.balanceOf(address(dist));
-        assertGe(contractBalance, pendingPostFix,
-            "contract must hold enough to honor pending claim (no insolvency)");
+
+        // Mint-on-claim: distributor never holds tokens. The "no leak"
+        // invariant: pending must equal total emitted (10×100 ether). Round 7's
+        // notify, fired while totalActivePower==0, is queued into pendingPool
+        // and folded back in by the next non-zero-supply notify. NFT is sole
+        // participant for every round it was active, so it sweeps the pool.
+        // The leak the H-2 fix prevents is OVER-claiming (>1000), not under.
+        assertEq(pendingPostFix, 1000 ether,
+            "sole-participant NFT pending equals total emitted (no leak above this)");
+
+        // Now actually claim and verify the rewardMinter mints exactly that.
+        uint256 balBefore = ardi.balanceOf(holderA);
+        vm.prank(holderA); dist.claim(ids);
+        assertEq(ardi.balanceOf(holderA) - balBefore, pendingPostFix,
+            "claim must mint exactly the pending amount, no leak");
     }
 
     /// L-4 audit regression: migrateExisting must skip NFTs that were
@@ -454,5 +482,210 @@ contract RoundBasedDecayTest is Test {
         vm.prank(holderB);
         vm.expectRevert();
         dist.claim(ids);
+    }
+
+    /// Reward-follows-NFT: A mints, distributor accrues reward to the NFT,
+    /// A transfers to B before claiming, B claims and gets the full
+    /// historical reward. A claiming after the transfer must get nothing.
+    function test_transferCarriesUnclaimedReward_toNewOwner() public {
+        uint256 tid = _mint(holderA, 0, "fire");
+        // 3 rounds of emissions while A holds — NFT accrues 3×100 = 300 ether.
+        for (uint256 i = 0; i < 3; ++i) _notify(100 ether);
+
+        uint256[] memory ids = new uint256[](1); ids[0] = tid;
+        assertEq(dist.pendingFor(holderA, ids), 300 ether, "A's NFT has 300 pending pre-transfer");
+
+        // A transfers to B WITHOUT claiming. Distributor's onTransfer hook
+        // must NOT settle pending to A — it stays attached to the NFT.
+        vm.prank(holderA);
+        nft.transferFrom(holderA, holderB, tid);
+
+        // 2 more rounds while B holds.
+        for (uint256 i = 0; i < 2; ++i) _notify(100 ether);
+
+        // B should be able to claim the FULL 5×100 = 500 ether.
+        uint256 bBefore = ardi.balanceOf(holderB);
+        vm.prank(holderB); dist.claim(ids);
+        assertEq(ardi.balanceOf(holderB) - bBefore, 500 ether,
+            "B inherits all unclaimed reward, including A's pre-transfer share");
+
+        // A trying to claim must revert (no longer the owner).
+        vm.prank(holderA);
+        vm.expectRevert();
+        dist.claim(ids);
+
+        // After B claimed, pending must drop to zero.
+        assertEq(dist.pendingFor(holderB, ids), 0, "all reward minted, none left");
+    }
+
+    /// Reward-follows-NFT through expiration: 7 rounds → NFT bump-evicted at
+    /// dura=0. A transfers the dead NFT to B. B claims the full earned
+    /// reward (capped at expR snapshot — no leak from post-expiry rounds).
+    /// A gets nothing.
+    function test_transferCarriesUnclaimedReward_afterExpiration() public {
+        // power=50, maxDur=7. 7 rounds → effectiveDurability=0.
+        uint256 tid = _mint(holderA, 0, "fire");
+        for (uint256 i = 0; i < 7; ++i) _notify(100 ether);
+        assertEq(uint256(nft.effectiveDurability(tid)), 0);
+
+        uint256[] memory ids = new uint256[](1); ids[0] = tid;
+        uint256 earned = dist.pendingFor(holderA, ids);
+        assertGt(earned, 0, "NFT earned reward over its 7 active rounds");
+
+        // Two more rounds while NFT is dead. capped-acc must keep pending
+        // flat — no post-expiration accrual.
+        for (uint256 i = 0; i < 2; ++i) _notify(100 ether);
+        assertEq(dist.pendingFor(holderA, ids), earned,
+            "expired NFT does not accrue further reward");
+
+        // A transfers the dead NFT to B.
+        vm.prank(holderA);
+        nft.transferFrom(holderA, holderB, tid);
+
+        // B claims and receives the full earned reward.
+        uint256 bBefore = ardi.balanceOf(holderB);
+        vm.prank(holderB); dist.claim(ids);
+        assertEq(ardi.balanceOf(holderB) - bBefore, earned,
+            "new owner inherits dead NFT's full earned reward");
+
+        // A gets nothing if they try.
+        vm.prank(holderA);
+        vm.expectRevert();
+        dist.claim(ids);
+    }
+
+    /// Mint-on-claim: claim must revert MinterNotSet if rewardMinter unset.
+    /// Critical safety: an upgrade window where ardiNFTv32 is wired but
+    /// rewardMinter is not should not silently mint nothing.
+    function test_claim_reverts_when_rewardMinterUnset() public {
+        // Simulate: deploy a fresh proxy, wire ardiNFTv32 but skip minter.
+        EmissionDistributor edImpl = new EmissionDistributor();
+        bytes memory init = abi.encodeCall(
+            EmissionDistributor.initialize, (owner, address(ardi), operator)
+        );
+        address freshDistProxy = address(new ERC1967Proxy(address(edImpl), init));
+        EmissionDistributorV2 freshImpl = new EmissionDistributorV2();
+
+        vm.startPrank(owner);
+        EmissionDistributor(freshDistProxy).setArdiNFT(address(nft));
+        IUUPSPx(freshDistProxy).upgradeToAndCall(address(freshImpl), "");
+        // setArdiNFTv32 requires `a == ardiNFT` so this is fine.
+        EmissionDistributorV2(freshDistProxy).setArdiNFTv32(address(nft));
+        // INTENTIONALLY skip setRewardMinter.
+        vm.stopPrank();
+
+        uint256[] memory ids = new uint256[](1); ids[0] = 1;
+        vm.prank(holderA);
+        vm.expectRevert(EmissionDistributorV2.MinterNotSet.selector);
+        EmissionDistributorV2(freshDistProxy).claim(ids);
+    }
+
+    /// Mint-on-claim: notifyReward must succeed without operator holding
+    /// or approving any $ardi (distributor doesn't pull tokens anymore).
+    function test_notifyReward_needsNoOperatorBalance() public {
+        // Use a fresh operator with zero balance and no approval.
+        address poorOp = address(0xdead0001);
+        vm.prank(owner); dist.setOperator(poorOp);
+        // poorOp has no ardi; previously notifyReward would revert in safeTransferFrom.
+        assertEq(ardi.balanceOf(poorOp), 0);
+
+        _mint(holderA, 0, "fire");
+        vm.prank(poorOp); dist.notifyReward(1000 ether);
+
+        // Round bumped, accumulator updated, no token movement.
+        assertEq(uint256(nft.globalDecayRound()), 1);
+        assertEq(ardi.balanceOf(address(dist)), 0, "distributor holds no tokens");
+    }
+
+    /// Multi-token claim: aggregate across several NFTs in one call.
+    function test_claim_multiTokenAggregate() public {
+        uint256 tA1 = _mint(holderA, 0, "fire");
+        uint256 tA2 = _mint(holderA, 1, "water");
+        uint256 tB  = _mint(holderB, 2, "earth");
+        // Each NFT has power=50 (mock), totalActivePower=150.
+        _notify(300 ether);
+        // Per-power = 300 / 150 = 2 ether/power. Each NFT pending = 100 ether.
+
+        uint256[] memory ids = new uint256[](2); ids[0] = tA1; ids[1] = tA2;
+        uint256 balBefore = ardi.balanceOf(holderA);
+        vm.prank(holderA); dist.claim(ids);
+        assertEq(ardi.balanceOf(holderA) - balBefore, 200 ether,
+            "A claims both NFTs in one tx");
+
+        // Holder B's NFT untouched.
+        uint256[] memory idsB = new uint256[](1); idsB[0] = tB;
+        assertEq(dist.pendingFor(holderB, idsB), 100 ether, "B unaffected");
+    }
+
+    /// Duplicate-tokenId claim: passing same tokenId twice must not
+    /// double-mint. Second occurrence finds rewardDebt already settled.
+    function test_claim_duplicateTokenIdSafe() public {
+        uint256 tid = _mint(holderA, 0, "fire");
+        _notify(100 ether);
+
+        uint256[] memory ids = new uint256[](2); ids[0] = tid; ids[1] = tid;
+        uint256 balBefore = ardi.balanceOf(holderA);
+        vm.prank(holderA); dist.claim(ids);
+        assertEq(ardi.balanceOf(holderA) - balBefore, 100 ether,
+            "duplicates do not double-mint");
+    }
+
+    /// Round-trip A → B → A: each transfer must reset attribution to the
+    /// current owner; final claim by A picks up everything.
+    function test_transfer_roundTrip_finalOwnerGetsAll() public {
+        uint256 tid = _mint(holderA, 0, "fire");
+        _notify(100 ether);  // A holds, NFT accrues 100
+        vm.prank(holderA); nft.transferFrom(holderA, holderB, tid);
+        _notify(100 ether);  // B holds, NFT accrues +100
+        vm.prank(holderB); nft.transferFrom(holderB, holderA, tid);
+        _notify(100 ether);  // A holds again, NFT accrues +100
+
+        uint256[] memory ids = new uint256[](1); ids[0] = tid;
+        uint256 balBefore = ardi.balanceOf(holderA);
+        vm.prank(holderA); dist.claim(ids);
+        assertEq(ardi.balanceOf(holderA) - balBefore, 300 ether,
+            "final owner sweeps the entire history");
+
+        // B can't claim — not current owner.
+        vm.prank(holderB);
+        vm.expectRevert();
+        dist.claim(ids);
+    }
+
+    /// setRewardMinter rebind: owner can repoint minter mid-life.
+    /// New claims route to the new minter; old parked reward unaffected.
+    function test_setRewardMinter_rebind() public {
+        uint256 tid = _mint(holderA, 0, "fire");
+        _notify(100 ether);
+
+        MockMinter newMinter = new MockMinter(ardi);
+        vm.prank(owner); dist.setRewardMinter(address(newMinter));
+
+        uint256[] memory ids = new uint256[](1); ids[0] = tid;
+        vm.prank(holderA); dist.claim(ids);
+        assertEq(newMinter.totalMinted(), 100 ether, "claim routes to new minter");
+        assertEq(minter.totalMinted(), 0, "old minter untouched");
+    }
+
+    /// Zero-power input fuzz: claim with empty tokenIds + nothing parked
+    /// emits Claimed(0) and does not call rewardMinter (no minter call).
+    function test_claim_emptyArrayNoOp() public {
+        uint256[] memory ids = new uint256[](0);
+        uint256 balBefore = ardi.balanceOf(holderA);
+        vm.prank(holderA); dist.claim(ids);
+        assertEq(ardi.balanceOf(holderA), balBefore, "empty claim mints nothing");
+        assertEq(minter.totalMinted(), 0, "minter not invoked");
+    }
+
+    /// Operator spam attack mitigation check: notifyReward(0) still
+    /// advances rounds. Documents the (accepted) attack surface — operator
+    /// key compromise can drain everyone's dura but cannot mint tokens.
+    function test_notifyZero_advancesRound_butMintsNothing() public {
+        uint256 tid = _mint(holderA, 0, "fire");
+        uint256 duraBefore = nft.effectiveDurability(tid);
+        vm.prank(operator); dist.notifyReward(0);
+        assertEq(uint256(nft.effectiveDurability(tid)), duraBefore - 1,
+            "notify(0) still bumps round and burns 1 dura");
+        assertEq(minter.totalMinted(), 0, "no mint side-effect");
     }
 }

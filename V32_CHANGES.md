@@ -12,6 +12,8 @@ shifts, plus several admin tools added on the back of them.
 | Eviction from earning pool | Permissionless `expireToZero` (needs keepers) | Atomic, inside `notifyReward` (no keepers) |
 | Repair after expire | **BUG**: pays fee, restores durability, but never re-joins the active pool. NFT silent forever. | Fixed: `_onRepairRandomness` success path re-activates if needed. |
 | Owner durability override | None | `adminSetDurability`, `adminRewindDecayRound`, `adminBumpAllDurability` |
+| Reward delivery | Operator pre-funds distributor; `claim` does `safeTransfer`. | **Mint-on-claim**: distributor never holds tokens; `claim` calls external `rewardMinter.batchMint`. |
+| Pending attribution on transfer | Settles to `from`'s `pendingOf` mapping. | **Reward-follows-NFT**: pending stays on the tokenId; new owner inherits everything unclaimed. |
 
 ## Files
 
@@ -44,8 +46,10 @@ uint256[46] private __v32Gap;
 `EmissionDistributorV2` adds:
 ```solidity
 mapping(uint64 => uint256) public accAtEndOfRound;
-IArdiNFTv32 public ardiNFTv32;  // same address as ardiNFT, typed view
-uint256[48] private __v32Gap;
+IArdiNFTv32 public ardiNFTv32;       // same address as ardiNFT, typed view
+IRewardMinter public rewardMinter;   // external batch-mint contract
+mapping(uint256 => uint256) public unclaimedByToken;  // reward parked on NFTs
+uint256[46] private __v32Gap;
 ```
 
 ## Critical migration step (post-upgrade, pre-first-notifyReward)
@@ -178,3 +182,89 @@ correctable / UI-only and don't affect on-chain solvency.
 
 Test count 12 → 14 (added `test_migrateExisting_idempotent_for_postUpgradeMinted`
 and `test_activate_idempotent_on_v32_side`).
+
+## Audit fixes applied (fourth pass, 2026-05-04 — distribution model)
+
+External auditor recommendation: replace pre-funded transfer model with
+**mint-on-claim**, and replace **address-attributed** pending-on-transfer
+with **NFT-attributed** (reward follows the NFT, not the seller).
+
+### Why this is safer than v3 distribution
+
+1. **Operator key blast radius shrinks**. v3 operator must hold ≥24M $ardi
+   and approve the distributor; if the operator EOA leaks, attacker drains
+   approved balance. v3.2 operator only needs the right to call
+   `notifyReward(amount)` — an attacker calling notifyReward cannot mint
+   tokens (only the external `rewardMinter` can), so the worst case is
+   "spam notifyReward(0) to advance rounds and burn everyone's dura". A
+   bad outcome but not a token-theft outcome.
+2. **Distributor solvency invariant disappears**. The contract no longer
+   needs to hold $ardi backing claims; mint happens on demand. There's no
+   "operator forgot to fund" failure mode where claims revert on
+   insufficient balance.
+3. **Marketplace UX matches user mental model**. Buyers of high-power
+   ardi NFTs expect to inherit any unclaimed reward; settle-on-transfer
+   surprised buyers who didn't realize the reward got stranded with the
+   seller.
+
+### What changed in EmissionDistributorV2
+
+- **`notifyReward(amount)`** no longer calls `safeTransferFrom`. It is now
+  a pure account update (round bump + `accRewardPerPower` update). The
+  contract holds no $ardi balance during normal operation.
+- **`claim(tokenIds)`** now (a) verifies ownership via `IERC721.ownerOf`
+  (ground truth, not the cached `s.holder`), (b) sums per-token pending
+  using cap-aware accumulator, (c) drains `unclaimedByToken[tid]`, and
+  (d) calls `rewardMinter.batchMint([msg.sender], [total])` to mint the
+  reward fresh.
+- **`onTransfer(tokenId, from, to)`** does NOT settle pending to `from`.
+  It just rotates the cached `s.holder = to`. `s.rewardDebt` is
+  untouched, so the new owner's first claim collects everything
+  accumulated since the previous claim — including the pre-transfer share.
+  Deactivated NFTs (s.power == 0) are now allowed to transfer (no-op
+  hook); their parked reward in `unclaimedByToken[tid]` follows the NFT.
+- **`onDeactivate(tokenId, holder)`** parks the final settled `owed`
+  into `unclaimedByToken[tokenId]` instead of `pendingOf[holder]`. The
+  parked reward stays with the NFT and is claimable by any future owner.
+- **`pendingFor(holder, tokenIds)`** drops the `pendingOf[holder]` base
+  and stops checking `ownerOf` (a view should not revert on garbage
+  input). Sums per-token active accrual + parked. Auth lives in `claim`.
+- **New owner-only `setRewardMinter(address)`** — binds the external
+  minter contract. Distributor must be granted MERKLE_ROLE on the
+  underlying $ardi minter for `batchMint` calls to succeed.
+
+### What stays the same
+
+- The accRewardPerPower / round / `_capAcc` math is unchanged; the H-2
+  solvency fix from the second audit pass still applies.
+- `pendingOf[address]` mapping in the base v3 contract still exists in
+  storage (we cannot remove parent state) but is no longer written to or
+  read from. Pre-upgrade balances are zero (no notifyReward fired in v3),
+  so there is no migration concern.
+- All admin overrides (`adminSetDurability` et al) work as before.
+
+### Trust assumptions on `rewardMinter`
+
+- Must implement `batchMint(address[], uint256[])` per `IRewardMinter`
+  with semantics "for each i, mint amounts[i] of $ardi to recipients[i]".
+- Must hold MINTER/MERKLE_ROLE on the $ardi token contract.
+- May internally remap recipients (e.g. `IAWPRegistry.resolveRecipients`).
+  Distributor passes the claimer's address verbatim; the minter contract
+  is the one resolving. Document this for users so claims arriving at a
+  remapped address aren't a surprise.
+- A malicious or paused minter can DoS `claim` (revert), but cannot
+  produce phantom rewards on the distributor side. Distributor's pending
+  state is preserved on revert (no state changes outlive a failed mint).
+
+### Storage layout impact
+
+Two new slots taken from `__v32Gap`: `rewardMinter` (1) and
+`unclaimedByToken` mapping (1). `__v32Gap` size 48 → 46. Storage layout
+remains UUPS-upgrade-compatible — no existing slots touched, no
+ordering shuffled.
+
+### Tests added (count 14 → 17 18, all passing)
+
+- `test_transferCarriesUnclaimedReward_toNewOwner` — A accrues 300, transfers, B accrues 200, B claims 500, A revert.
+- `test_transferCarriesUnclaimedReward_afterExpiration` — NFT bump-evicted at dura=0, transferred while dead, new owner claims earned reward, no post-expiry leak.
+- `test_repairBumpEvictedDuringVRF_noLeak` — H-2 regression rewritten for mint-on-claim: claim mints exactly pendingFor, no over-mint.
