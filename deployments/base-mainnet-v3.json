@@ -1,0 +1,23 @@
+{
+  "chainId": 8453,
+  "network": "base-mainnet",
+  "version": "v3",
+  "deployedAt": 1777822097,
+  "owner": "0x7aC6e9042fB5148B3f5dAf9bADFb8cF33Ef66f43",
+  "coordinator": "0x99AB1D66aF35ea4C16c6407e94D75b2f6a31338e",
+  "treasury": "0x7aC6e9042fB5148B3f5dAf9bADFb8cF33Ef66f43",
+  "operator": "0x7aC6e9042fB5148B3f5dAf9bADFb8cF33Ef66f43",
+  "ardiNFTv3": "0xf68425D0d451699d0d766150634E436Acd2F05A1",
+  "emissionDistributor": "0x180D7271f1E3Eb8dbF635E24A1B79e9718611a65",
+  "epochDrawV3": "0xA57d8E6646E063FFd6eae579d4f327b689dA5DC3",
+  "vrfAdapterEpoch": "0xB628881E2C735ebeE20B51A3098f0Af6d8D012c2",
+  "vrfAdapterNFT": "0xf5a21CE09daEf088edc60b6511570717640c4036",
+  "vaultMerkleRootV3": "0x135744267bf3b8c5cc4f998f5bac489c3cffcedfb888931e8defb0ea80a10c28",
+  "awpAllocator": "0x0000D6BB5e040E35081b3AaF59DD71b21C9800AA",
+  "ardiWorknetId": 845300000014,
+  "kyaWorknetId": 845300000012,
+  "minStake": "10000000000000000000000",
+  "ardiOTC": "0xEd4A2B66756fB3aB0f7a4fC9d442dccF3162B68F",
+  "ardiOTC_deployedAt": 1777854900,
+  "ardiOTC_replaces": "0xbAa9571C4b1837da8219DD7907a577FC04635A7B"
+}
