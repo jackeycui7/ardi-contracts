@@ -130,3 +130,32 @@ L-2 (cap accounting in `pendingPool` zero-power branch) and L-3
 (view-only double-count when same tokenId passed twice to
 `pendingFor`) are documented but not patched — both are operator-
 correctable / UI-only and don't affect on-chain solvency.
+
+## Audit fixes applied (second pass, 2026-05-04)
+
+- **H-2** (CRITICAL, **solvency-breaking**): repair-during-bump-eviction
+  let the NFT claim more $ardi than was distributed to it. Sequence:
+    1. NFT has `expR=10`, `currentDur=2`, `globalDecayRound=8`.
+    2. Holder calls `repair()` — `currentDur` refreshes to maxDur, but
+       `repair()` does NOT touch `expirationRoundOf`. VRF request fires.
+    3. `notifyReward` fires before VRF callback. Bump consumes
+       `expiringPowerAt[10]` (includes NFT's power); `totalActivePower`
+       drops; `accAtEndOfRound[10]` snapshots. NFT's `s.power` slot in
+       distributor is NOT cleared (no per-NFT iteration during bump).
+    4. VRF callback fires (success). Pre-fix, the success path took the
+       "still tracked" branch, set `expR = globalDecayRound + maxDur`
+       (a future round), and left the distributor desync'd.
+    5. Future `notifyReward` distributions now exclude the NFT from the
+       denominator, but `_capAcc` returns full `accRewardPerPower`
+       (because `globalDecayRound <= expR`). NFT claims `power × acc /
+       1e18 - 0 (rewardDebt)`, which includes accrual from rounds whose
+       distributions did NOT include the NFT — claim exceeds deposit,
+       contract goes insolvent.
+
+  **Fix**: `_onRepairRandomness` success path detects bump-eviction
+  via `ins.activeTracked && oldExp != 0 && oldExp <= globalDecayRound`,
+  and calls `_deactivate` + `_activate` to resync the distributor side.
+  Both onDeactivate and onActivate are wired to handle this correctly
+  (onDeactivate's `wasBumpEvicted` guard skips the totalActive
+  subtraction; onActivate adds the power back). Regression test:
+  `test_repairBumpEvictedDuringVRF_noLeak` confirms post-fix solvency.

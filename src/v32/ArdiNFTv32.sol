@@ -204,16 +204,39 @@ contract ArdiNFTv32 is ArdiNFTv3 {
         // to also re-activate or refresh expiration BEFORE the cleanup,
         // and super conflates both.
         Inscription storage ins = inscriptions[req.tokenId];
-        if (!ins.activeTracked) {
-            // NFT was kicked out (expireToZero). Re-activate. _activate
-            // computes expirationRound from the freshly refreshed
-            // currentDurability (which repair() set to maxDurability
-            // before scheduling the VRF request).
-            _activate(req.tokenId, ownerOf(req.tokenId));
+        uint64 oldExp = expirationRoundOf[req.tokenId];
+        // Three states the NFT can be in at VRF callback time:
+        //   (a) untracked: expireToZero was called between repair() and now.
+        //   (b) tracked + expR > currentRound: still in the active pool.
+        //       Refresh expR forward.
+        //   (c) tracked + expR <= currentRound: a notifyReward happened
+        //       between repair() and now, the bump path consumed
+        //       expiringPowerAt[expR] and subtracted this NFT's power
+        //       from totalActivePower. ins.activeTracked stayed true and
+        //       s.power stayed set, so without intervention `_capAcc`
+        //       would return full accRewardPerPower for this NFT
+        //       (because we're about to set expR > currentRound) — the
+        //       NFT would claim rewards from rounds whose distributions
+        //       did NOT include it in the denominator. Solvency hole.
+        //       Fix: deactivate + reactivate so the distributor side
+        //       resyncs (totalActivePower += power, s.power refreshed,
+        //       expR registered cleanly).
+        bool wasBumpEvicted = ins.activeTracked
+            && oldExp != 0
+            && oldExp <= globalDecayRound;
+        if (!ins.activeTracked || wasBumpEvicted) {
+            address holder = ownerOf(req.tokenId);
+            if (wasBumpEvicted) {
+                // _deactivate detects (expR <= globalDecayRound) via
+                // EmissionDistributorV2.onDeactivate's wasBumpEvicted
+                // check, so it skips the totalActive subtraction (already
+                // done by the bump). Then _activate re-adds the power.
+                _deactivate(req.tokenId, holder);
+            }
+            _activate(req.tokenId, holder);
         } else {
-            // NFT still in the pool. Refresh expiration: pull old
+            // (b) NFT still in the pool. Refresh expiration: pull old
             // expiration's power, push new one.
-            uint64 oldExp = expirationRoundOf[req.tokenId];
             uint128 p = uint128(ins.power);
             if (oldExp > globalDecayRound) {
                 uint128 cur = expiringPowerAt[oldExp];

@@ -335,6 +335,60 @@ contract RoundBasedDecayTest is Test {
         assertEq(dist.pendingFor(holderA, ids), 0, "unregistered token earns nothing");
     }
 
+    /// H-2 audit regression: holder calls repair() while NFT still has
+    /// some durability, but a notifyReward fires between repair() and
+    /// VRF callback. The bump path consumes expiringPowerAt[oldExpR]
+    /// and subtracts power from totalActivePower BEFORE the callback
+    /// can refresh expR. Without the fix, _capAcc would return full
+    /// accRewardPerPower (because the callback set expR > currentRound)
+    /// even though future distributions don't include the NFT in their
+    /// denominator → NFT claims an "extra" share that isn't backed
+    /// by any deposit → contract goes insolvent.
+    function test_repairBumpEvictedDuringVRF_noLeak() public {
+        // NFT minted at round 0 with maxDur=7 → expR=7.
+        uint256 tid = _mint(holderA, 0, "fire");
+        // Push 6 rounds — NFT effective dura is now 1, expR still 7.
+        for (uint256 i = 0; i < 6; ++i) _notify(100 ether);
+        assertEq(uint256(nft.effectiveDurability(tid)), 1);
+        assertEq(uint256(nft.expirationRoundOf(tid)), 7);
+
+        // Holder repairs. currentDurability refreshes to maxDur=7.
+        // expirationRoundOf is still 7 (repair() doesn't touch it).
+        vm.prank(holderA);
+        uint256 reqId = nft.repair(tid);
+
+        // Round 7's notifyReward fires BEFORE VRF callback. This is the
+        // race that triggers the bug.
+        _notify(100 ether);
+        // Now: globalDecayRound = 7, expiringPowerAt[7] consumed,
+        //      totalActivePower -= 50, but ins.activeTracked still true
+        //      and s.power still 50.
+        assertEq(dist.totalActivePower(), 0);
+
+        // VRF callback fires success. THE FIX: detect bump-eviction,
+        // deactivate + reactivate so the distributor side resyncs.
+        vm.prank(address(rng));
+        nft.onRandomness(reqId, 12345);
+
+        // Post-fix invariants:
+        //   1. NFT is back in the active pool (totalActivePower includes it).
+        //   2. expR is set to a future round.
+        //   3. Future notifyReward correctly increments NFT's accrual.
+        assertEq(dist.totalActivePower(), 50, "NFT must be back in pool");
+        assertGt(uint256(nft.expirationRoundOf(tid)), uint256(nft.globalDecayRound()));
+
+        // Now the solvency-critical check: simulate a few more rounds and
+        // verify the contract holds enough $ardi to pay every claim.
+        for (uint256 i = 0; i < 3; ++i) _notify(100 ether);
+
+        uint256[] memory ids = new uint256[](1); ids[0] = tid;
+        uint256 pendingPostFix = dist.pendingFor(holderA, ids);
+        // Total deposited to the distributor: 10 notifies × 100 ether = 1000
+        uint256 contractBalance = ardi.balanceOf(address(dist));
+        assertGe(contractBalance, pendingPostFix,
+            "contract must hold enough to honor pending claim (no insolvency)");
+    }
+
     function test_notHolder_cannotClaimSomeoneElsesNFT() public {
         uint256 tid = _mint(holderA, 0, "fire");
         _notify(100 ether);
