@@ -102,6 +102,21 @@ uint256[46] private __v32Gap;
   is "every active NFT gets `by` extra rounds" — equivalent to per-NFT
   durability bump for currently-active NFTs. Tokens that were already
   expired DO NOT come back from this (their snapshot is permanent).
+- **⚠ `adminRewindDecayRound` / `adminBumpAllDurability` state-drift caveat**.
+  Rewinding the round counter makes `effectiveDurability` of every NFT
+  larger (they appear "more alive"). However, NFTs that were
+  bump-evicted in the rewound rounds are NOT automatically returned to
+  `totalActivePower` on the distributor side — the eviction was
+  push-based when `notifyReward` originally fired. Result: those NFTs
+  display dura > 0 but earn nothing on subsequent `notifyReward`. To
+  fully undo a `notifyReward` mistake, owner must rewind AND manually
+  re-activate evicted NFTs (e.g. via `adminSetDurability(tid,
+  maxDurability)` per token, which re-registers them in
+  `expiringPowerAt` and via the override path also flows back into the
+  distributor). For a launch-day operator mistake this is the cost of
+  recovery; design the runbook accordingly. **Recommendation**: only use
+  rewind in the same tx as a reverted notifyReward, before any NFT has
+  hit dura=0 — otherwise plan for per-NFT cleanup.
 - **`adminSetMaxDurability` uses `this.adminSetDurability`** as a fallback
   when shrinking max below current. This costs one external call but
   keeps the registry consistent. Owner-only path; gas is not a concern.
