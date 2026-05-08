@@ -1,0 +1,22 @@
+{
+  "fire": 0,
+  "flame": 1,
+  "ember": 2,
+  "spark": 3,
+  "blaze": 4,
+  "water": 5,
+  "ocean": 6,
+  "river": 7,
+  "ice": 8,
+  "steam": 9,
+  "forest": 10,
+  "tree": 11,
+  "leaf": 12,
+  "seed": 13,
+  "moss": 14,
+  "stone": 15,
+  "mountain": 16,
+  "iron": 17,
+  "silver": 18,
+  "gold": 19
+}

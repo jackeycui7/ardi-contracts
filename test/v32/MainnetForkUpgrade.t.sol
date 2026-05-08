@@ -32,7 +32,7 @@ contract ForkMockMinter {
 
 /// @notice Mainnet fork dry-run for the v3.2 upgrade. Validates:
 ///   - UUPS upgrade succeeds against the real production storage
-///   - migrateExisting works on real active tokenIds (gas, idempotency)
+///   - batchMigrate works on real active tokenIds (gas, idempotency)
 ///   - First notifyReward(24M) computes plausible accRewardPerPower
 ///     against real totalActivePower (~109K)
 ///   - A real holder's pendingFor matches expected share
@@ -99,16 +99,16 @@ contract MainnetForkUpgradeTest is Test {
         assertEq(uint256(nft.globalDecayRound()), 0, "fresh round counter");
     }
 
-    function test_fork_migrateExisting_realTokenIds() public {
+    function test_fork_batchMigrate_realTokenIds() public {
         if (block.chainid != 8453) { vm.skip(true); return; }
         vm.startPrank(OWNER);
         dist.pause();
 
-        // Run migrateExisting on a 200-batch of real tokenIds.
+        // Run batchMigrate on a 200-batch of real tokenIds.
         uint256 gasBefore = gasleft();
-        nft.migrateExisting(sampleTokenIds);
+        nft.batchMigrate(sampleTokenIds);
         uint256 gasUsed = gasBefore - gasleft();
-        emit log_named_uint("gas used for migrateExisting(200 tids)", gasUsed);
+        emit log_named_uint("gas used for batchMigrate(200 tids)", gasUsed);
 
         // Every migrated tid must have non-zero expirationRoundOf and
         // v32Migrated=true. Spot-check 5 tokenIds.
@@ -116,7 +116,7 @@ contract MainnetForkUpgradeTest is Test {
             uint256 tid = sampleTokenIds[i];
             uint64 expR = nft.expirationRoundOf(tid);
             assertGt(uint256(expR), 0, "expR set after migrate");
-            assertTrue(nft.v32Migrated(tid), "v32Migrated flag set");
+            // (v32Migrated tracking removed; expirationRoundOf != 0 is the new idempotency proxy)
         }
         dist.unpause();
         vm.stopPrank();
@@ -127,7 +127,7 @@ contract MainnetForkUpgradeTest is Test {
         // Migrate everything in our sample so they are eligible.
         vm.startPrank(OWNER);
         dist.pause();
-        nft.migrateExisting(sampleTokenIds);
+        nft.batchMigrate(sampleTokenIds);
         dist.unpause();
 
         uint256 totalActivePowerBefore = dist.totalActivePower();
@@ -154,7 +154,7 @@ contract MainnetForkUpgradeTest is Test {
         // Pick the first migrated token + its real owner.
         vm.startPrank(OWNER);
         dist.pause();
-        nft.migrateExisting(sampleTokenIds);
+        nft.batchMigrate(sampleTokenIds);
         dist.unpause();
         dist.notifyReward(24_000_000 ether);
         vm.stopPrank();
@@ -177,15 +177,15 @@ contract MainnetForkUpgradeTest is Test {
         assertEq(amount, pending, "minted amount equals pendingFor");
     }
 
-    function test_fork_migrateExisting_idempotent_secondRunNoOp() public {
+    function test_fork_batchMigrate_idempotent_secondRunNoOp() public {
         if (block.chainid != 8453) { vm.skip(true); return; }
         vm.startPrank(OWNER);
         dist.pause();
-        nft.migrateExisting(sampleTokenIds);
+        nft.batchMigrate(sampleTokenIds);
 
         // Second run on same set should be a cheap no-op.
         uint256 gasBefore = gasleft();
-        nft.migrateExisting(sampleTokenIds);
+        nft.batchMigrate(sampleTokenIds);
         uint256 gasUsed = gasBefore - gasleft();
         emit log_named_uint("gas for SECOND migrate (idempotent)", gasUsed);
 

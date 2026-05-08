@@ -729,49 +729,27 @@ contract AuditR5_StaleFuse is _NftFixture {
         reqId = nft.fuse(1, 2, "smoke", 75, 0, 4, sig);
     }
 
-    function test_R5_cancelMyFuseRefundsHolder() public {
-        uint256 fee = nft.fuseBaseFee();
-        uint256 balBefore = ardi.balanceOf(holder);
-        _setupFuseRequest();
-        assertEq(ardi.balanceOf(holder), balBefore - fee, "fee charged");
-
-        // Holder cannot cancel before 12h.
-        skip(11 hours);
+    /// @notice Fuse mechanic was deprecated 2026-05-08 (forge took over).
+    ///         fuse() / cancelMyFuse / forceFailStaleFuse now revert with
+    ///         "FuseDeprecated". Storage slots preserved for layout compat.
+    function test_R5_cancelMyFuseRefundsHolder_deprecated() public {
         vm.prank(holder);
-        vm.expectRevert(ArdiNFTv3.NotStale.selector);
+        vm.expectRevert(bytes("FuseDeprecated"));
         nft.cancelMyFuse(1);
-
-        skip(2 hours);
-        vm.prank(holder);
-        nft.cancelMyFuse(1);
-        assertEq(ardi.balanceOf(holder), balBefore, "fee refunded on cancel");
-
-        // Tokens unlocked, both still active.
-        assertEq(nft.pendingFuseOf(1), 0);
-        assertEq(nft.pendingFuseOf(2), 0);
     }
 
-    function test_R5_forceFailStaleFuseRefundsHolderNotTreasury() public {
-        uint256 fee = nft.fuseBaseFee();
-        uint256 balBefore = ardi.balanceOf(holder);
-        uint256 trBefore = ardi.balanceOf(treasury);
-        _setupFuseRequest();
-
-        skip(7 hours); // past keeper window (6h)
-        // Mallory keeper calls — fee must go to holder, NOT treasury.
+    function test_R5_forceFailStaleFuse_deprecated() public {
         address mallory = address(0xBAD);
         vm.prank(mallory);
+        vm.expectRevert(bytes("FuseDeprecated"));
         nft.forceFailStaleFuse(1);
-
-        assertEq(ardi.balanceOf(holder), balBefore, "fee refunded to holder");
-        assertEq(ardi.balanceOf(treasury), trBefore, "treasury unchanged (no fuse happened)");
     }
 
-    function test_R5_cancelMyFuseRejectsNonHolder() public {
-        _setupFuseRequest();
-        skip(13 hours);
+    function test_R5_cancelMyFuse_deprecated_anyCaller() public {
+        // Both holder and non-holder hit FuseDeprecated revert before
+        // any auth check (since fuse mechanic is dead).
         vm.prank(address(0x4cad));
-        vm.expectRevert(ArdiNFTv3.NotTokenOwner.selector);
+        vm.expectRevert(bytes("FuseDeprecated"));
         nft.cancelMyFuse(1);
     }
 }

@@ -24,4 +24,8 @@ interface IEmissionDistributor {
     ///         received daily mint from WorknetToken (Q1: Operator address, not the
     ///         distributor itself, holds the minter role).
     function notifyReward(uint256 amount) external;
+
+    /// @notice Total power across all currently-active NFTs. Read by the
+    ///         NFT side to compute repairFee (v3.2.1: dynamic pricing).
+    function totalActivePower() external view returns (uint256);
 }

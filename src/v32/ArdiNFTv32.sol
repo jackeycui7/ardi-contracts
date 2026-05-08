@@ -57,28 +57,20 @@ contract ArdiNFTv32 is ArdiNFTv3 {
     ///         at activate / repair as `globalDecayRound + currentDurability`.
     mapping(uint256 => uint64) public expirationRoundOf;
 
-    /// @notice True for tokens that have already been migrated from the
-    ///         v3 time-decay model into the v32 round model. Existing
-    ///         holders get refreshed to maxDurability the first time
-    ///         migrateExisting visits them; this flag prevents double-credit.
-    mapping(uint256 => bool) public v32Migrated;
+    /// @notice (Deprecated; preserved for storage layout). Was a per-token
+    ///         flag set on first batchMigrate visit. Replaced by reading
+    ///         expirationRoundOf[tid] != 0, which serves the same idempotency
+    ///         guard for free.
+    mapping(uint256 => bool) private __reserved_v32Migrated;
 
     // ============================ V32 events ============================
 
     event DecayRoundBumped(uint64 indexed newRound, uint128 expiredPower);
-    event V32Migrated(uint256 indexed tokenId, uint8 newDurability, uint64 expirationRound);
-    event AdminDurabilitySet(uint256 indexed tokenId, uint8 oldValue, uint8 newValue);
-    event AdminMaxDurabilitySet(uint256 indexed tokenId, uint8 oldValue, uint8 newValue);
-    event AdminBumpedAll(uint8 by);
-    event AdminRoundRewound(uint64 by, uint64 newRound);
 
     // ============================ V32 errors ============================
 
     error NotEmissionDistributor();
-    error AlreadyMigrated();
-    error NotActiveTracked();
     // InvalidDurability re-uses the inherited declaration from ArdiNFTv3.
-    error CannotRewindBelowZero();
 
     // =========================== Round bump =============================
 
@@ -270,134 +262,32 @@ contract ArdiNFTv32 is ArdiNFTv3 {
 
     // ===================== One-time v3 → v32 migration ===================
 
-    /// @notice Owner-only batch migration. Iterates the supplied tokenIds
-    ///         and, for each tracked but unmigrated NFT, refreshes
-    ///         currentDurability to maxDurability and registers it in the
-    ///         expiration ledger as if freshly minted at globalDecayRound.
-    ///         Sky-mandated launch-day reset: every existing holder gets
-    ///         a full charge in the new system.
-    /// @dev    Owner runs this AFTER the upgrade and BEFORE the first
-    ///         post-upgrade `notifyReward`. Idempotent — re-supplying
-    ///         already-migrated tokenIds is a no-op (does not double-credit).
-    ///         Safe to chunk over many tx; recommend ≤ 200 tokenIds/call
-    ///         to stay well under the block gas limit.
-    function migrateExisting(uint256[] calldata tokenIds) external onlyOwner {
+    /// @notice Owner-only batch migration. For each active, unmigrated
+    ///         tokenId, refreshes currentDurability to maxDurability and
+    ///         registers it in the expiration ledger. Idempotent — skips
+    ///         already-migrated tokens (expirationRoundOf != 0) and
+    ///         inactive tokens. ≤ 200 tokenIds per call recommended.
+    function batchMigrate(uint256[] calldata tokenIds) external onlyOwner {
         uint64 cur = globalDecayRound;
         for (uint256 i = 0; i < tokenIds.length; ++i) {
             uint256 tid = tokenIds[i];
-            if (v32Migrated[tid]) continue;
+            if (expirationRoundOf[tid] != 0) continue;
             Inscription storage ins = inscriptions[tid];
-            if (!ins.activeTracked) {
-                v32Migrated[tid] = true; // mark even when skipped — never revisit
-                continue;
-            }
-            // L-4 audit defense: skip if already registered via post-
-            // upgrade _activate (e.g. NFT minted after the upgrade).
-            // Without this guard a second `expiringPowerAt[expR] +=
-            // power` would double-count the NFT in the eviction
-            // bucket. v32Migrated is also set so subsequent batch
-            // calls short-circuit on the cheaper flag check.
-            if (expirationRoundOf[tid] != 0) {
-                v32Migrated[tid] = true;
-                continue;
-            }
-
+            if (!ins.activeTracked) continue;
             uint8 maxD = ins.maxDurability;
             ins.currentDurability = maxD;
-            ins.lastDecayCheckpoint = uint64(block.timestamp);
-            uint64 expR = cur + uint64(maxD);
-            expirationRoundOf[tid] = expR;
-            expiringPowerAt[expR] += uint128(ins.power);
-            v32Migrated[tid] = true;
-            emit V32Migrated(tid, maxD, expR);
+            uint64 newExp = cur + uint64(maxD);
+            expirationRoundOf[tid] = newExp;
+            expiringPowerAt[newExp] += uint128(ins.power);
         }
     }
 
-    // ============================ Admin tools ============================
+    // (adminSetDurability + _setDurability removed pre-launch to fit
+    //  EIP-170. Re-add via UUPS upgrade if owner needs per-NFT durability
+    //  override post-launch.)
 
-    /// @notice Owner override: set a single NFT's currentDurability and
-    ///         re-register its expirationRound. Useful for one-off
-    ///         corrections (e.g. an NFT got into a weird state via a
-    ///         partial migration). Reverts on inactive tokens.
-    function adminSetDurability(uint256 tokenId, uint8 newValue) external onlyOwner {
-        _setDurability(tokenId, newValue);
-    }
-
-    /// @dev Internal worker so other admin paths can re-use without
-    ///      taking the external onlyOwner detour (which would change
-    ///      msg.sender to address(this) and revert).
-    function _setDurability(uint256 tokenId, uint8 newValue) internal {
-        Inscription storage ins = inscriptions[tokenId];
-        if (!ins.activeTracked) revert NotActiveTracked();
-        if (newValue > ins.maxDurability) revert InvalidDurability();
-
-        // Pull old expiration credit.
-        uint64 oldExp = expirationRoundOf[tokenId];
-        uint128 p = uint128(ins.power);
-        if (oldExp > globalDecayRound) {
-            uint128 c = expiringPowerAt[oldExp];
-            expiringPowerAt[oldExp] = c > p ? c - p : 0;
-        }
-        uint8 prev = ins.currentDurability;
-        ins.currentDurability = newValue;
-        // Schedule for removal at the next bump if newValue==0; otherwise
-        // give the NFT `newValue` more rounds. Both branches register the
-        // power into the appropriate future bucket.
-        uint64 newExp =
-            newValue == 0 ? globalDecayRound + 1 : globalDecayRound + uint64(newValue);
-        expirationRoundOf[tokenId] = newExp;
-        expiringPowerAt[newExp] += p;
-        emit AdminDurabilitySet(tokenId, prev, newValue);
-    }
-
-    /// @notice Owner override: bump ALL active NFTs' currentDurability by
-    ///         a constant. Implemented as a globalDecayRound rewind +
-    ///         per-NFT registry refresh would require iteration; instead
-    ///         we use the rewind: subtract `by` from globalDecayRound,
-    ///         which is mathematically equivalent to "every active NFT
-    ///         got `by` extra rounds".
-    /// @dev    Refuses to rewind below 0.
-    function adminBumpAllDurability(uint8 by) external onlyOwner {
-        if (by == 0) return;
-        if (uint64(by) > globalDecayRound) revert CannotRewindBelowZero();
-        unchecked {
-            globalDecayRound -= uint64(by);
-        }
-        emit AdminBumpedAll(by);
-        emit AdminRoundRewound(uint64(by), globalDecayRound);
-    }
-
-    /// @notice Owner override: directly rewind globalDecayRound (e.g. for
-    ///         operational mistakes — a notifyReward fired that shouldn't
-    ///         have, want to give everyone a round back). Does NOT undo
-    ///         the accRewardPerPower change in EmissionDistributor; that's
-    ///         a separate concern.
-    function adminRewindDecayRound(uint64 by) external onlyOwner {
-        if (by == 0) return;
-        if (by > globalDecayRound) revert CannotRewindBelowZero();
-        unchecked {
-            globalDecayRound -= by;
-        }
-        emit AdminRoundRewound(by, globalDecayRound);
-    }
-
-    /// @notice Owner override: set maxDurability for a single NFT. Use
-    ///         when raising / lowering the cap on a token (e.g. limited
-    ///         edition). currentDurability is clamped down to the new max
-    ///         if necessary.
-    function adminSetMaxDurability(uint256 tokenId, uint8 newMax) external onlyOwner {
-        if (newMax == 0) revert InvalidDurability();
-        Inscription storage ins = inscriptions[tokenId];
-        uint8 prev = ins.maxDurability;
-        ins.maxDurability = newMax;
-        if (ins.currentDurability > newMax) {
-            // Direct internal call — avoids the v32-audit H-1 footgun
-            // where `this.adminSetDurability(...)` makes msg.sender be
-            // the contract itself, which fails the onlyOwner check.
-            _setDurability(tokenId, newMax);
-        }
-        emit AdminMaxDurabilitySet(tokenId, prev, newMax);
-    }
+    // (adminRewindDecayRound removed pre-launch to fit EIP-170. If needed
+    //  for emergency operator-mistake recovery, re-add via UUPS upgrade.)
 
     // ============================ Storage gap ============================
     //

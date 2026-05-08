@@ -422,7 +422,12 @@ contract ArdiNFTv3 is
         return uint8(ins.currentDurability - daysGone);
     }
 
-    function repairFee(uint256 tokenId) public view returns (uint256) {
+    /// @notice v3.2.1 hook: subclass can require-revert to gate `repair()`
+    ///         on additional preconditions (e.g. effectiveDurability == 0).
+    ///         Default no-op preserves v3 behavior.
+    function _beforeRepair(uint256 /* tokenId */) internal virtual {}
+
+    function repairFee(uint256 tokenId) public view virtual returns (uint256) {
         Inscription storage ins = inscriptions[tokenId];
         return repairBaseUnitPrice * ins.power * ins.maxDurability;
     }
@@ -433,6 +438,7 @@ contract ArdiNFTv3 is
     ///         "call repair, revert if broken" attack: the caller cannot know
     ///         the result in the same tx.
     function repair(uint256 tokenId) external virtual whenNotPaused nonReentrant returns (uint256 reqId) {
+        _beforeRepair(tokenId);
         if (ownerOf(tokenId) != msg.sender) revert NotTokenOwner();
         Inscription storage ins = inscriptions[tokenId];
         if (ins.broken) revert Broken();
@@ -513,56 +519,17 @@ contract ArdiNFTv3 is
         emit RepairCancelled(tokenId, reqId, msg.sender);
     }
 
-    /// @notice (R2-MED-01) Holder-only escape hatch for stuck fuse, mirroring
-    ///         cancelMyRepair. Without this, an orphaned fuse would block
-    ///         setRandomness adapter rotation forever via pendingRequestsCount.
-    ///         Refunds the fuse fee, unlocks both tokens, NFTs survive intact.
-    function cancelMyFuse(uint256 tokenIdA) external nonReentrant {
-        uint256 reqId = pendingFuseOf[tokenIdA];
-        if (reqId == 0) revert NoPendingRequest();
-        PendingRequest memory req = pending[reqId];
-        if (req.holder != msg.sender) revert NotTokenOwner();
-        if (block.timestamp < req.requestedAt + REPAIR_HOLDER_CANCEL_AFTER) revert NotStale();
-
-        delete pendingFuseOf[req.tokenId];
-        delete pendingFuseOf[req.tokenIdB];
-        delete pending[reqId];
-        --pendingRequestsCount;
-
-        if (req.paid > 0) {
-            ardi.safeTransfer(msg.sender, req.paid);
-        }
-        emit FuseCancelled(req.tokenId, req.tokenIdB, reqId, msg.sender);
+    /// @notice cancelMyFuse / forceFailStaleFuse — fuse() is deprecated;
+    ///         these guard rails are kept as 1-line reverts to free
+    ///         EIP-170 budget. No fuse can become pending in v4+ since
+    ///         the entry function reverts, so these are unreachable in
+    ///         practice anyway.
+    function cancelMyFuse(uint256) external virtual nonReentrant {
+        revert("FuseDeprecated");
     }
 
-    /// @notice (R2-MED-01) Permissionless cleanup for a stuck fuse VRF
-    ///         request. After REPAIR_STALE_AFTER (6h) anyone may settle the
-    ///         request as a no-op fuse non-event: both tokens unlock, fee
-    ///         REFUNDED TO THE HOLDER (R5-1: NO real fuse happened, so the
-    ///         holder shouldn't lose their 20K ardi to a keeper griefing
-    ///         window). Keeper gets the 50 ardi bounty from treasury for
-    ///         doing the bookkeeping. NFTs survive intact.
-    function forceFailStaleFuse(uint256 tokenIdA) external nonReentrant {
-        uint256 reqId = pendingFuseOf[tokenIdA];
-        if (reqId == 0) revert NoPendingRequest();
-        PendingRequest memory req = pending[reqId];
-        if (block.timestamp < req.requestedAt + REPAIR_STALE_AFTER) revert NotStale();
-
-        delete pendingFuseOf[req.tokenId];
-        delete pendingFuseOf[req.tokenIdB];
-        delete pending[reqId];
-        --pendingRequestsCount;
-
-        // R5-1: refund the fuse fee to the holder — the contract's own
-        // semantic is "no fuse actually happened", so the keeper should not
-        // be able to seize the fee just by being first to call after 6h.
-        if (req.paid > 0) {
-            ardi.safeTransfer(req.holder, req.paid);
-        }
-
-        bool paid = _tryPayKeeper(msg.sender);
-        emit FuseForceFailed(req.tokenId, req.tokenIdB, reqId, msg.sender);
-        if (!paid) emit KeeperBountyUnpaid(msg.sender, KEEPER_BOUNTY);
+    function forceFailStaleFuse(uint256) external virtual nonReentrant {
+        revert("FuseDeprecated");
     }
 
     /// @notice Permissionless: if an NFT's effective durability has hit 0 and
@@ -629,74 +596,19 @@ contract ArdiNFTv3 is
     ///         intent), but the dice roll itself is now VRF, not coordinator-
     ///         supplied. Coordinator only signs (newWord, newPower, newLang,
     ///         newElement) — success/fail comes from chain.
+    /// @notice fuse() was deprecated pre-launch and never called on
+    ///         mainnet. Stripped to a 1-line revert to free EIP-170 budget
+    ///         for v4 forge. Storage slots (`pendingFuseOf`, `fuseBaseFee`,
+    ///         etc.) preserved so v4Mainnet inherits compatible layout.
     function fuse(
-        uint256 tokenIdA,
-        uint256 tokenIdB,
-        string calldata newWord,
-        uint16 newPower,
-        uint8 newLangId,
-        uint8 newElement,
-        bytes calldata signature
-    ) external whenNotPaused nonReentrant returns (uint256 reqId) {
-        if (tokenIdA == tokenIdB) revert SameTokenId();
-        if (ownerOf(tokenIdA) != msg.sender) revert NotTokenOwner();
-        if (ownerOf(tokenIdB) != msg.sender) revert NotTokenOwner();
-        if (newLangId > LANG_DE) revert InvalidLanguage();
-        if (newElement == 0 || newElement > ELEMENT_MAX) revert InvalidElement();
-        if (pendingFuseOf[tokenIdA] != 0 || pendingFuseOf[tokenIdB] != 0) revert AlreadyFusing();
-        if (pendingRepairOf[tokenIdA] != 0 || pendingRepairOf[tokenIdB] != 0) {
-            revert AlreadyRepairing();
-        }
-
-        uint256 _nonce = fusionNonceOf[msg.sender];
-        bytes32 digest = keccak256(
-            abi.encodePacked(
-                "ARDI_FUSE_V4",
-                block.chainid,
-                address(this),
-                msg.sender,
-                tokenIdA,
-                tokenIdB,
-                newWord,
-                newPower,
-                newLangId,
-                newElement,
-                _nonce
-            )
-        ).toEthSignedMessageHash();
-        if (digest.recover(signature) != coordinator) revert InvalidSignature();
-        unchecked {
-            ++fusionNonceOf[msg.sender];
-        }
-
-        // Pay fuse fee. Burn share routed at completion (success or fail).
-        ardi.safeTransferFrom(msg.sender, address(this), fuseBaseFee);
-
-        reqId = randomness.requestRandomness();
-        pendingFuseOf[tokenIdA] = reqId;
-        pendingFuseOf[tokenIdB] = reqId;
-        pending[reqId] = PendingRequest({
-            kind: ReqKind.Fuse,
-            tokenId: tokenIdA,
-            tokenIdB: tokenIdB,
-            holder: msg.sender,
-            requestedAt: uint64(block.timestamp),
-            newWord: newWord,
-            newPower: newPower,
-            newLangId: newLangId,
-            newElement: newElement,
-            paid: fuseBaseFee
-        });
-        unchecked {
-            ++pendingRequestsCount;
-        }
-
-        emit FuseRequested(msg.sender, tokenIdA, tokenIdB, reqId);
+        uint256, uint256, string calldata, uint16, uint8, uint8, bytes calldata
+    ) external virtual whenNotPaused nonReentrant returns (uint256) {
+        revert("FuseDeprecated");
     }
 
     // =============================== VRF callback =================================
 
-    function onRandomness(uint256 requestId, uint256 randomWord) external override nonReentrant {
+    function onRandomness(uint256 requestId, uint256 randomWord) external virtual override nonReentrant {
         if (msg.sender != address(randomness)) revert NotRandomness();
         PendingRequest memory req = pending[requestId];
         if (req.kind == ReqKind.None) revert NoPendingRequest();
@@ -725,92 +637,14 @@ contract ArdiNFTv3 is
         }
     }
 
-    function _onFuseRandomness(uint256 reqId, PendingRequest memory req, uint256 r) internal {
-        // Read latest power on each side at fulfil time (might've changed via
-        // partial repairs; can't via transfer because pendingFuseOf locked).
-        uint16 pA = inscriptions[req.tokenId].power;
-        uint16 pB = inscriptions[req.tokenIdB].power;
-
-        // Success rate scales with combined power; here a flat 60% per spec.
-        // If we want power-weighted success we can move this to coord-set later.
-        bool success = (r % 100) < 60;
-
-        delete pendingFuseOf[req.tokenId];
-        delete pendingFuseOf[req.tokenIdB];
-        delete pending[reqId];
-        // H2-2: guard removed; revert on underflow exposes invariant break.
-        --pendingRequestsCount;
-
-        // Route fuse fee.
-        _flushSinkFuse(req.paid);
-
-        if (success) {
-            uint8 genA = inscriptions[req.tokenId].generation;
-            uint8 genB = inscriptions[req.tokenIdB].generation;
-            uint8 newGen = (genA > genB ? genA : genB) + 1;
-
-            // Deactivate both before burn so distributor sees correct power.
-            address holder = req.holder;
-            if (inscriptions[req.tokenId].activeTracked) _deactivate(req.tokenId, holder);
-            if (inscriptions[req.tokenIdB].activeTracked) _deactivate(req.tokenIdB, holder);
-
-            _burn(req.tokenId);
-            _burn(req.tokenIdB);
-
-            unchecked {
-                ++fusionCount;
-            }
-            uint256 newTokenId = ORIGINAL_CAP + fusionCount;
-            uint256[] memory parents = new uint256[](2);
-            parents[0] = req.tokenId;
-            parents[1] = req.tokenIdB;
-
-            // Fresh durability: max(maxDurA, maxDurB), random within that
-            // range using the same VRF word (cheap, no extra request).
-            uint8 maxDurA = inscriptions[req.tokenId].maxDurability;
-            uint8 maxDurB = inscriptions[req.tokenIdB].maxDurability;
-            uint8 newMaxDur = maxDurA > maxDurB ? maxDurA : maxDurB;
-            if (newMaxDur == 0) newMaxDur = 5;
-
-            Inscription storage ins = inscriptions[newTokenId];
-            ins.word = req.newWord;
-            ins.power = req.newPower;
-            ins.languageId = req.newLangId;
-            ins.generation = newGen;
-            ins.inscriber = holder;
-            ins.mintTimestamp = uint64(block.timestamp);
-            ins.element = req.newElement;
-            ins.maxDurability = newMaxDur;
-            ins.currentDurability = newMaxDur;
-            ins.lastDecayCheckpoint = uint64(block.timestamp);
-            ins.parents = parents;
-
-            // H-4: _activate BEFORE _safeMint so the ERC721Receiver hook sees
-            // a fully-consistent state. nonReentrant (transient) protects this
-            // entrypoint, but a malicious receiver could still re-enter
-            // EmissionDistributor and observe activeTracked=false / power=0
-            // for the just-minted token if we minted first.
-            _activate(newTokenId, holder);
-            _safeMint(holder, newTokenId);
-
-            emit Fused(
-                holder,
-                req.tokenId,
-                req.tokenIdB,
-                newTokenId,
-                req.newWord,
-                req.newPower,
-                req.newLangId,
-                req.newElement,
-                newGen
-            );
-        } else {
-            uint256 burnId = pA <= pB ? req.tokenId : req.tokenIdB;
-            address holder = req.holder;
-            if (inscriptions[burnId].activeTracked) _deactivate(burnId, holder);
-            _burn(burnId);
-            emit FusionFailed(holder, req.tokenId, req.tokenIdB, burnId);
-        }
+    /// @notice _onFuseRandomness — fuse() entry reverts so this is
+    ///         unreachable in practice. Kept as a 1-line revert to free
+    ///         EIP-170 budget. v4Mainnet's onRandomness override never
+    ///         routes here; v3-base would only reach here if someone
+    ///         crafted a phantom Fuse pending request, which the entry
+    ///         guards prevent.
+    function _onFuseRandomness(uint256, PendingRequest memory, uint256) internal virtual {
+        revert("FuseDeprecated");
     }
 
     function _flushSinkRepair(uint256 amount) internal {
@@ -821,12 +655,10 @@ contract ArdiNFTv3 is
         if (rest > 0) ardi.safeTransfer(treasury, rest);
     }
 
-    function _flushSinkFuse(uint256 amount) internal {
-        if (amount == 0) return;
-        uint256 burnAmt = (amount * fuseBurnBps) / BPS_DENOM;
-        if (burnAmt > 0) ardi.safeTransfer(address(0xdead), burnAmt);
-        uint256 rest = amount - burnAmt;
-        if (rest > 0) ardi.safeTransfer(treasury, rest);
+    /// @notice _flushSinkFuse — fuse path is dead, function kept as no-op
+    ///         (callable only by `_onFuseRandomness` which itself reverts).
+    function _flushSinkFuse(uint256) internal {
+        // unreachable in v4+; kept for inheritance + EIP-170 trim.
     }
 
     // =============================== Hooks to distributor =================================

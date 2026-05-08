@@ -1,0 +1,9 @@
+{
+  "model": "all-MiniLM-L6-v2",
+  "model_hash_sha256": "9aac00c6dbcebe8407a31a6023bb14393280ed7dfe4b3771ea3fcb10b0931dc6",
+  "model_hash_keccak_solidity_input": "keccak256(abi.encodePacked(\"all-MiniLM-L6-v2/sentence-transformers\"))",
+  "target_dims": 96,
+  "n_words": 20,
+  "pca_hash_sha256": "f1e68cf6b69ebafd29d34582dede02cafe9541ed16db91d9a3aee9ccbc39708c",
+  "embeddings_hash_sha256": "82776056fb96da66d72b3b9a8baec2c55317e03f969b3922806b0b996a964fad"
+}

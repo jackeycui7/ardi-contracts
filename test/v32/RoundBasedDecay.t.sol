@@ -63,7 +63,7 @@ contract MockMinter {
 ///   • round-based decay replaces time-based
 ///   • notifyReward distributes only to dura > 0 NFTs
 ///   • repair after expireToZero correctly re-activates emission
-///   • migrateExisting refreshes pre-v32 NFTs to maxDurability
+///   • batchMigrate refreshes pre-v32 NFTs to maxDurability
 ///   • admin overrides (setDurability / rewindDecayRound) behave
 contract RoundBasedDecayTest is Test {
     ArdiNFTv32 nft;
@@ -264,7 +264,7 @@ contract RoundBasedDecayTest is Test {
         assertEq(uint256(nft.expirationRoundOf(tid)), uint256(nft.globalDecayRound()) + 7);
     }
 
-    function test_migrateExisting_refreshesPreV32Tokens() public {
+    function test_batchMigrate_refreshesPreV32Tokens() public {
         // Mint pre-existing NFT (in the test setUp, upgrade already
         // happened, but globalDecayRound is still 0 and the mint goes
         // through the post-upgrade _activate). To simulate a "pre-v32
@@ -276,45 +276,24 @@ contract RoundBasedDecayTest is Test {
         // We don't actually need to corrupt — _mint went through
         // ArdiNFTv32._activate so it's already migrated. But we can
         // re-simulate by clearing the migration flag then calling
-        // migrateExisting; the function should be idempotent.
+        // batchMigrate; the function should be idempotent.
         (mappedSlot);
         uint256[] memory ids = new uint256[](1); ids[0] = tid;
-        // Should be no-op (already migrated).
+        // Should be no-op (already migrated — expirationRoundOf != 0).
+        uint64 expBefore = nft.expirationRoundOf(tid);
         vm.prank(owner);
-        nft.migrateExisting(ids);
-        // Migration flag now true.
-        assertTrue(nft.v32Migrated(tid));
+        nft.batchMigrate(ids);
+        assertEq(uint256(nft.expirationRoundOf(tid)), uint256(expBefore),
+            "batchMigrate is no-op when expR already set");
     }
 
-    function test_adminRewindDecayRound_givesEveryoneExtraDuration() public {
-        uint256 tid = _mint(holderA, 0, "fire");
-        // Burn through 5 rounds.
-        for (uint256 i = 0; i < 5; ++i) _notify(100 ether);
-        assertEq(uint256(nft.effectiveDurability(tid)), 2);
+    // adminRewindDecayRound removed pre-launch to fit EIP-170 size limit.
 
-        // Owner gives everyone +3 rounds.
-        vm.prank(owner);
-        nft.adminRewindDecayRound(3);
-        assertEq(uint256(nft.effectiveDurability(tid)), 5);
-        assertEq(uint256(nft.globalDecayRound()), 2);
-    }
-
-    function test_adminSetDurability_repointsExpirationRound() public {
-        uint256 tid = _mint(holderA, 0, "fire");
-        // Owner forces dura down to 2.
-        vm.prank(owner);
-        nft.adminSetDurability(tid, 2);
-        assertEq(uint256(nft.effectiveDurability(tid)), 2);
-
-        // After 2 notifies, NFT expires.
-        _notify(100 ether);
-        _notify(100 ether);
-        assertEq(uint256(nft.effectiveDurability(tid)), 0);
-        assertEq(dist.totalActivePower(), 0);
-    }
+    // adminSetDurability removed pre-launch to fit EIP-170; re-add via
+    // UUPS upgrade if owner needs per-NFT durability override post-launch.
 
     /// M-1 audit regression: an unmigrated NFT must NOT earn rewards
-    /// from notifyReward calls fired before migrateExisting completes.
+    /// from notifyReward calls fired before batchMigrate completes.
     /// The earlier version returned full accRewardPerPower for expR=0
     /// tokens, which let the holder drain the protocol.
     function test_unmigrated_token_earns_zero() public {
@@ -323,7 +302,7 @@ contract RoundBasedDecayTest is Test {
         // To simulate "unmigrated", clear expirationRoundOf manually.
         uint256 tid = _mint(holderA, 0, "fire");
         // Sneak: force expirationRoundOf back to 0 to mimic an upgrade
-        // that hasn't run migrateExisting yet for this token.
+        // that hasn't run batchMigrate yet for this token.
         bytes32 slot = keccak256(abi.encode(uint256(tid), uint256(2))); // expirationRoundOf is the 3rd v32 storage var → slot index depends on layout; we'll just test via the public path.
         (slot); // placeholder reference
         // Instead, exploit adminSetDurability to a value, then poke
@@ -417,12 +396,12 @@ contract RoundBasedDecayTest is Test {
             "claim must mint exactly the pending amount, no leak");
     }
 
-    /// L-4 audit regression: migrateExisting must skip NFTs that were
+    /// L-4 audit regression: batchMigrate must skip NFTs that were
     /// minted post-upgrade and already auto-registered via _activate.
-    /// Without the guard, calling migrateExisting on such a tokenId
+    /// Without the guard, calling batchMigrate on such a tokenId
     /// would double-credit expiringPowerAt[expR] → eviction bucket
     /// over-subtracts → other holders get diluted.
-    function test_migrateExisting_idempotent_for_postUpgradeMinted() public {
+    function test_batchMigrate_idempotent_for_postUpgradeMinted() public {
         // setUp already upgraded; this mint goes through the v32
         // _activate path and registers expR.
         uint256 tid = _mint(holderA, 0, "fire");
@@ -430,17 +409,15 @@ contract RoundBasedDecayTest is Test {
         uint128 bucketBefore = nft.expiringPowerAt(expR);
         assertEq(uint256(bucketBefore), 50, "post-mint bucket should hold one NFT");
 
-        // Owner mistakenly includes this token in migrateExisting.
+        // Owner mistakenly includes this token in batchMigrate.
         uint256[] memory ids = new uint256[](1); ids[0] = tid;
         vm.prank(owner);
-        nft.migrateExisting(ids);
+        nft.batchMigrate(ids);
 
         // Bucket must NOT have been incremented again.
         uint128 bucketAfter = nft.expiringPowerAt(expR);
         assertEq(uint256(bucketAfter), uint256(bucketBefore),
             "L-4 fix: post-upgrade-minted token must not be re-registered");
-        // Migrated flag should be set so future batches short-circuit.
-        assertTrue(nft.v32Migrated(tid));
     }
 
     /// L-5 audit regression: _activate is idempotent on the v32-side
